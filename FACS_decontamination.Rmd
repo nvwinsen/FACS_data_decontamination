@@ -1,0 +1,379 @@
+---
+title: "FACS_decontamination"
+author: "Nathan Vanwinsen"
+date: "2025-11-28"
+output: html_document
+---
+
+```{r Step 0: Load packages include=FALSE}
+# Set path of working directory-----
+path <- getwd()
+path_input <- paste0(path, "/Input/")
+path_results <- paste0(path, "/Results/")
+
+# Load packages----
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(tidyr)
+
+# seed for reproducibility----
+set.seed(777)
+
+# Resolution images----
+dpi <- 300
+```
+
+```{r Step 1: Load data and preprocessing}
+# Load dada2 output (seqtab.nochim and taxa)-----
+# Output from dada2 pipeline
+seqtab.nochim <- read.csv(paste0(path_input, "seqtab.nochim.csv"), row.names =
+                            1)
+# Output after taxonomy assignment with dada2 without bootsrap or bootstrap removed
+taxa <- read.csv(paste0(path_input, "taxa.csv"), row.names = 1)
+
+# Create ASVtable-----
+ASVtable <- seqtab.nochim
+ASVfasta <- colnames(ASVtable)
+newcolnames_ASVtable <- paste("ASV", seq(1, length(ASVfasta), 1), sep =
+                                "")
+ASVfasta <- cbind(newcolnames_ASVtable, ASVfasta)
+write.csv(ASVfasta, paste0(path_input, "ASVfasta_DADA2.csv"))
+colnames(ASVtable) <- newcolnames_ASVtable
+dim(ASVtable)
+write.csv(ASVtable, paste0(path_input, "ASVtable.csv"))
+ASVtable <- read.csv(paste0(path_input, "ASVtable.csv"), row.names = 1)
+
+# Proces assignTaxonomy output-----
+renametaxa <- rownames(taxa)
+taxa <- data.table(taxa)
+taxa[is.na(taxa$Kingdom), names(taxa) := as.list(rep("unclassified", 7))]
+taxa[is.na(taxa$Phylum), names(taxa)[2:7] := as.list(rep("Bacteria_unclassified", 6))]
+taxa[is.na(taxa$Class), names(taxa)[3:7] := do.call(paste, c(taxa[is.na(taxa$Class), 2], "unclassified", sep =
+                                                               "_"))]
+taxa[is.na(taxa$Order), names(taxa)[4:7] := do.call(paste, c(taxa[is.na(taxa$Order), 3], "unclassified", sep =
+                                                               "_"))]
+taxa[is.na(taxa$Family), names(taxa)[5:7] := do.call(paste, c(taxa[is.na(taxa$Family), 4], "unclassified", sep =
+                                                                "_"))]
+taxa[is.na(taxa$Genus), names(taxa)[6:7] := do.call(paste, c(taxa[is.na(taxa$Genus), 5], "unclassified", sep =
+                                                               "_"))]
+taxa[is.na(taxa$Species), ]$Species <- "unclassified"
+taxa <- data.frame(taxa)
+rownames(taxa) <- renametaxa
+
+# Merge ASVtable and taxa information from DADA2-----
+ASVtax <- cbind(taxa[colnames(ASVtable), ], t(ASVtable))
+ASVtax <- na.omit(ASVtax)
+head(ASVtax)
+write.csv(ASVtax, paste0(path_input, "ASVtax.csv"), row.names = TRUE)
+ASVtax <- read.csv(paste0(path_input, "ASVtax.csv"),
+                   row.names = 1,
+                   check.names = FALSE)
+
+# Add Genus and species level to create species name-----
+ASVtax$Species[grepl("^unclassified$", ASVtax$Species)] <- paste0(ASVtax$Genus[grepl("^unclassified$", ASVtax$Species)], "_", ASVtax$Species[grepl("^unclassified$", ASVtax$Species)])
+ASVtax$Species[!grepl("unclassified", ASVtax$Species)] <-  paste0(ASVtax$Genus[!grepl("unclassified", ASVtax$Species)], " ", ASVtax$Species[!grepl("unclassified", ASVtax$Species)])
+
+# Create species aggregated ASV table-----
+speciesASVtable <- aggregate(. ~ Species, data = ASVtax[, -c(1:6)], FUN =
+                               sum)
+
+rownames(speciesASVtable) <- speciesASVtable[, 1]
+speciesASVtable <- speciesASVtable[, -1]
+write.csv(
+  speciesASVtable,
+  file = paste0(path_input, "speciesASVtable.csv"),
+  row.names = TRUE
+)
+
+speciesASVtable_prop <- sweep(speciesASVtable, 2, colSums(speciesASVtable), '/')
+colSums(speciesASVtable_prop) # Check if sums are = 1
+```
+
+```{r Step 2: Threshold sensitivity analysis}
+speciesASVtable <- read.csv(file = paste0(path_input, "speciesASVtable.csv"),
+                            row.names = 1)
+ASVtax$ASV <- row.names(ASVtax)
+ASVtax <- ASVtax %>% dplyr::relocate(ASV, .before = "Kingdom")
+
+# Remove FACSome based on sheath fluid and other negative controls-----
+## Select contaminants to filter from sheath fluid---------
+# Insert the sample names of the sheath fluid sample(s) here:
+SFnames <- c("sheath1", "sheath2")
+SF <- speciesASVtable %>% dplyr::select(all_of(SFnames))
+SF <- SF[which(rowSums(SF) > 0), ]
+# If you worked with a mock community, you can filter out these species in the next lines
+# Here the zymobiomics mock is used
+# limosilactobacillus was not assigned up to species level by DADA2 and silva database
+species_mock <- c(
+  "Bacillus intestinalis",
+  "Enterococcus faecalis",
+  "Escherichia-Shigella coli",
+  "Limosilactobacillus_unclassified",
+  "Listeria monocytogenes",
+  "Pseudomonas aeruginosa",
+  "Salmonella enterica",
+  "Staphylococcus aureus"
+)
+SF <- SF[which(!(row.names(SF) %in% species_mock)), ]
+# If not go to this line
+contam_speciesSF <- row.names(SF)
+
+## Check on ASV level-----
+SF <- ASVtax %>% dplyr::select(
+  c(
+    "ASV",
+    "Kingdom",
+    "Phylum",
+    "Class",
+    "Order",
+    "Family",
+    "Genus",
+    "Species"
+  ),
+  all_of(SFnames)
+)
+SF <- SF[which(rowSums(SF[, SFnames]) > 0), ]
+SF <- SF[which(!(SF$Species %in% species_mock)), ] # only if you used a mock community
+contam_ASVs_SF <- row.names(SF)
+all_contam_SF <- ASVtax %>% dplyr::filter(ASV %in% contam_ASVs_SF)
+
+write.csv(
+  SF %>% dplyr::select(c("ASV", "Species", eval(SFnames))),
+  file = paste0(path_results, "Contaminants_sheath_fluid.csv"),
+  row.names = FALSE
+)
+
+## Select contaminants to filter from the blank (aPBS here):
+blanknames <- c("blank1", "blank2")
+blank <- speciesASVtable %>% dplyr::select(all_of(blanknames))
+blank <- blank[which(rowSums(blank) > 0), ]
+# If you worked with a mock community, you can filter out these species in the next lines
+blank <- blank[which(!(row.names(blank) %in% species_mock)), ]
+# If not go to this line
+contam_species_blank <- row.names(blank)
+
+## Check on ASV level-----
+blank <- ASVtax %>% dplyr::select(
+  c(
+    "ASV",
+    "Kingdom",
+    "Phylum",
+    "Class",
+    "Order",
+    "Family",
+    "Genus",
+    "Species"
+  ),
+  all_of(blanknames)
+)
+blank <- blank[which(rowSums(blank[, blanknames]) > 0), ]
+blank <- blank[which(!(blank$Species %in% species_mock)), ] # only if you used a mock community
+contam_ASVs_blank <- row.names(blank)
+all_contam_blank <- ASVtax %>% dplyr::filter(ASV %in% contam_ASVs_blank)
+
+write.csv(
+  blank %>% dplyr::select(c("ASV", "Species", eval(blanknames))),
+  file = paste0(path_results, "Contaminants_blank.csv"),
+  row.names = FALSE
+)
+
+## Find abundance contaminant SF ASVs in other samples---------
+# Insert the sample names of the high biomass sample(s) here:
+highbiomassNames <- c("B31", "B36", "B37", "B40", "B44")
+highbiomasstable <- ASVtax %>% dplyr::select(all_of(highbiomassNames))
+totalReads <- colSums(highbiomasstable)
+
+## perform sensitivity analysis for ideal threshold value, now set at 0.001----
+ASV_to_remove_SF <- data.frame(ASV = contam_ASVs_SF)
+ASV_to_remove_blank <- data.frame(ASV = contam_ASVs_blank)
+# Choose thresholds to test:
+thresholds <- c(
+  0.000001,
+  0.000005,
+  0.00001,
+  0.00005,
+  0.0001,
+  0.0005,
+  0.001,
+  0.005,
+  0.01,
+  0.05,
+  0.1,
+  0.5,
+  1
+)
+for (j in thresholds) {
+  ### First filter sheath fluid contaminants-----
+  nr <- 0
+  ASVtr <- data.frame()
+  for (i in contam_ASVs_SF) {
+    nr <- nr + 1
+    ratio <- highbiomasstable[i, ] / totalReads
+    # print(i)
+    # print(all(ratio < j)) # change this for sensitivity analysis......
+    ASVtr <- rbind(ASVtr, c(i, all(ratio < j)))
+  }
+  ASVtr
+  colnames(ASVtr) <- c("ASV", paste0("t_", j))
+  ASV_to_remove_SF <- merge(ASV_to_remove_SF, ASVtr, by = "ASV")
+  removed_ASVs_SF <- ASVtax[which(ASVtax$ASV %in% ASV_to_remove_SF$ASV[which(ASVtr[, 2] == TRUE)]), c("ASV", "Species")]
+  # write.csv(
+  #   removed_ASVs_SF,
+  #   file = paste0(path_results, "Removed_ASVs_sheath_fluid_t", j, ".csv"),
+  #   row.names = FALSE
+  # )
+  
+  ### Next filter blank contaminants-----
+  nr <- 0
+  ASVtr <- data.frame()
+  for (i in contam_ASVs_blank) {
+    nr <- nr + 1
+    ratio <- highbiomasstable[i, ] / totalReads
+    # print(i)
+    # print(all(ratio < j)) # change this for sensitivity analysis......
+    ASVtr <- rbind(ASVtr, c(i, all(ratio < j)))
+  }
+  ASVtr
+  colnames(ASVtr) <- c("ASV", paste0("t_", j))
+  ASV_to_remove_blank <- merge(ASV_to_remove_blank, ASVtr, by = "ASV")
+  removed_ASVs_blank <- ASVtax[which(ASVtax$ASV %in% ASV_to_remove_blank$ASV[which(ASVtr[, 2] == TRUE)]), c("ASV", "Species")]
+  # write.csv(
+  #   removed_ASVs_blank,
+  #   file = paste0(path_results, "Removed_ASVs_blank_t", j, ".csv"),
+  #   row.names = FALSE
+  # )
+}
+
+# Plot sensitivity analysis on sheath fluid contaminants-----
+ASV_to_remove_SF <-  merge(
+  ASV_to_remove_SF,
+  ASVtax %>% dplyr::select(ASV, Species),
+  by = "ASV",
+  all.y = FALSE
+)
+
+ASV_to_remove_SF_long <- pivot_longer(
+  data = ASV_to_remove_SF,
+  cols = paste0("t_", thresholds),
+  names_to = "threshold",
+  values_to = "keep"
+)
+ASV_to_remove_SF_long$threshold <- as.numeric(gsub("t_", "", ASV_to_remove_SF_long$threshold))
+ASV_to_remove_SF_long$threshold <- ASV_to_remove_SF_long$threshold * 100
+ASV_to_remove_SF_long$threshold <- factor(ASV_to_remove_SF_long$threshold, levels = thresholds *
+                                            100)
+
+contam_SF_plot <- ggplot(data = ASV_to_remove_SF_long,
+                         mapping = aes(
+                           x = threshold,
+                           y = paste0(ASV, ": ", Species),
+                           fill = keep
+                         )) +
+  geom_tile(color = "black") +
+  scale_fill_manual(
+    values = c("red", "blue"),
+    labels = c("Retained", "Removed"),
+    name = ""
+  ) +
+  xlab("Threshold (%)") +
+  ylab("Contaminating ASV:Species")
+
+contam_SF_plot <- contam_SF_plot + theme_minimal()
+contam_SF_plot
+
+tiff(
+  filename = paste0(path_results, "contaminants_sheath_fluid.tiff"),
+  width = 12 * dpi,
+  height = 6 * dpi,
+  res = dpi,
+  pointsize = 16,
+  compression = "lzw"
+)
+contam_SF_plot
+dev.off()
+
+# Show presence of these ASVs in other samples-----
+ASVtax[which(ASVtax$ASV %in% contam_ASVs_SF), -c(1:7)]
+
+# Plot sensitivity analysis on blank contaminants-----
+ASV_to_remove_blank <-  merge(
+  ASV_to_remove_blank,
+  ASVtax %>% dplyr::select(ASV, Species),
+  by = "ASV",
+  all.y = FALSE
+)
+
+ASV_to_remove_blank_long <- pivot_longer(
+  data = ASV_to_remove_blank,
+  cols = paste0("t_", thresholds),
+  names_to = "threshold",
+  values_to = "keep"
+)
+ASV_to_remove_blank_long$threshold <- as.numeric(gsub("t_", "", ASV_to_remove_blank_long$threshold))
+ASV_to_remove_blank_long$threshold <- ASV_to_remove_blank_long$threshold *
+  100
+ASV_to_remove_blank_long$threshold <- factor(ASV_to_remove_blank_long$threshold, levels = thresholds *
+                                               100)
+
+contam_blank_plot <- ggplot(data = ASV_to_remove_blank_long,
+                            mapping = aes(
+                              x = threshold,
+                              y = paste0(ASV, ": ", Species),
+                              fill = keep
+                            )) +
+  geom_tile(color = "black") +
+  scale_fill_manual(
+    values = c("red", "blue"),
+    labels = c("Retained", "Removed"),
+    name = ""
+  ) +
+  xlab("Threshold (%)") +
+  ylab("Contaminating ASV:Species")
+
+contam_blank_plot <- contam_blank_plot + theme_minimal()
+contam_blank_plot
+
+tiff(
+  filename = paste0(path_results, "contaminants_blank.tiff"),
+  width = 10 * dpi,
+  height = 6 * dpi,
+  res = dpi,
+  pointsize = 16,
+  compression = "lzw"
+)
+contam_blank_plot
+dev.off()
+
+# Show presence of these ASVs in other samples-----
+ASVtax[which(ASVtax$ASV %in% contam_ASVs_blank), -c(1:7)]
+
+```
+
+```{r Step 3: Deconatminate data}
+# Select the threshold of your choice in %-----
+select_thresh <- 0.1 # i.e. threshold 0.001 = 0.1 %
+# Filter sheath fluid contaminating ASVs from ASVtable--------
+remove_SF <- ASV_to_remove_SF_long %>% dplyr::filter(threshold == select_thresh)
+ASVtax_filt <- ASVtax %>% dplyr::filter(!(ASV %in% remove_SF))
+
+speciesASVtable_filt <- aggregate(. ~ Species, data = ASVtax_filt[, -c(1:7)], FUN =
+                                    sum)
+rownames(speciesASVtable_filt) <- speciesASVtable_filt[, 1]
+speciesASVtable_filt <- speciesASVtable_filt[, -1]
+
+# Filter blank contaminating ASVs from ASVtable--------
+remove_blank <- ASV_to_remove_blank_long %>% dplyr::filter(threshold == select_thresh)
+ASVtax_filt_filt <- ASVtax_filt %>% dplyr::filter(!(ASV %in% remove_blank))
+
+speciesASVtable_filt_filt <- aggregate(. ~ Species, data = ASVtax_filt_filt[, -c(1:7)], FUN =
+                                         sum)
+rownames(speciesASVtable_filt_filt) <- speciesASVtable_filt_filt[, 1]
+speciesASVtable_filt_filt <- speciesASVtable_filt_filt[, -1]
+
+write.csv(
+  ASVtax_filt_filt,
+  file = paste0(path_results, "ASVtax_decontam.csv"),
+  row.names = TRUE
+)
+```
